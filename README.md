@@ -39,6 +39,6 @@ INSERT DATA CMD COMMAND:
 
 Once these steps are completed, run `pip install -r requirements.txt` to install all the dependencies and then run the [main.py](main.py) file. The output should say app running.
 
-Access the API endpoint via a GET request of format `/recommendation customer_id=<id>`, or paste the URL outputted by the program in the terminal into a browser with the argument `/recommendation customer_id=<id>`.
+Access the API endpoint via a GET request of format `/recommendation?customer_id=<id>`, or paste the URL `http://localhost:8000/recommendation?customer_id=<id>` into a web browser (don't forget to swap in the customer ID!).
 
-The output should be the Natural Language Report with the timestamp, and it should also have generated a text file with the report in your local system.
+The output should be the Natural Language Report with the timestamp and the customer ID, and it should also have generated a text file with the report in your local system.
