@@ -1,10 +1,7 @@
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import logging
 from dataclasses import dataclass
 from typing_extensions import TypedDict
-from typing import Dict, List, Any, Optional
-from collections import Counter, defaultdict
+from typing import Dict, Any, Optional
 from google import genai
 from google.genai import types
 import os, json
@@ -12,7 +9,14 @@ from langgraph.graph import StateGraph, END
 from fastapi import FastAPI, HTTPException
 import uvicorn
 from datetime import datetime
-
+from langchain_community.utilities.sql_database import SQLDatabase
+from langchain import hub
+from langgraph.prebuilt import create_react_agent
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import AIMessage
+from pydantic import BaseModel
+from google.api_core.exceptions import TooManyRequests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,109 +32,66 @@ with open('config.json', 'r') as f:
 # State definition for LangGraph
 class AgentState(TypedDict):
     customer_id: str
-    customer_profile: Optional[Dict]
-    purchase_patterns: Optional[Dict]
-    product_affinities: Optional[List[Dict]]
-    opportunity_scores: Optional[List[Dict]]
-    research_report: Optional[str]
-    recommendations: Optional[List[Dict]]
+    customer_details: Optional[str]
+    purchase_patterns: Optional[str]
+    product_affinities: Optional[str]
+    opportunity_scores: Optional[str]
+    research_report: Optional[Any]
     error: Optional[str]
 
-@dataclass
-class CustomerProfile:
-    customer_id: str
-    customer_name: str
-    industry: str
-    annual_revenue: int
-    employees: int
-    priority: str
-    rating: str
-    account_type: str
-    location: str
-    current_products: str
-    product_usage: int
-    cross_sell_synergy: str
-    last_activity: str
-    opportunity_stage: str
-
-class DatabaseManager:
-    def __init__(self, config: Dict):
-        self.config = config
+class SQLAgent:
+    def __init__(self, dbconfig: Dict, model: str = 'gemini-2.0-flash-lite'):
+        """Initialize the SQLAgent with database configuration and model."""
+        
+        pg_uri = f"postgresql+psycopg2://{dbconfig['user']}:{dbconfig['password']}@{dbconfig['host']}:{dbconfig['port']}/{dbconfig['database']}"
+        db = SQLDatabase.from_uri(pg_uri)
+        
+        if not os.getenv("Gemini_API_Key"):
+            from getpass import getpass
+            os.environ["Gemini_API_Key"] = getpass("Enter API key for Google Gemini: ")
+        
+        llm = ChatGoogleGenerativeAI(
+            model=model,
+            google_api_key=os.getenv("Gemini_API_Key"),
+        )
+        
+        prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
+        system_message = prompt_template.format(dialect="PostgreSQL", top_k=3)
+        
+        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        
+        self.agent_executor = create_react_agent(llm, toolkit.get_tools(), prompt=system_message)
     
-    def get_connection(self):
-        return psycopg2.connect(**self.config)
-    
-    def execute_query(self, query: str, params: tuple = None):
+    def query(self, query: str) -> dict[str, Any] | Any:
+        """Execute a query to the database via the SQLAgent and return the result."""
+        
         try:
-            with self.get_connection() as conn:
-                with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                    cursor.execute(query, params)
-                    try:
-                        return cursor.fetchall()
-                    except psycopg2.ProgrammingError:
-                        # If no rows are returned, fetchall will raise ProgrammingError
-                        return []
+            return self.agent_executor.invoke(
+                {"messages": [("system", "Do as the user says. Replace any question marks in the data where there's a monetary value with the $ symbol. Provide all the results in a structured format, and don't include the SQL query in the output. Don't limit the SQL output anywhere."), ("user", query)]}
+            )
         except Exception as e:
-            logger.error(f"Database query error: {e}")
+            logger.error(f"SQL query error: {e}")
             raise
 
-
 class CustomerContextAgent:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db_manager = db_manager
+    def __init__(self, sql_agent: SQLAgent):
+        """Initialize the CustomerContextAgent with an SQLAgent instance."""
+        self.sql_agent = sql_agent
     
-    def extract_customer_profile(self, state: AgentState) -> AgentState:
+    def extract_customer_details(self, state: AgentState) -> AgentState:
+        """Extract customer details and purchase history from the database."""
         try:
             customer_id = state["customer_id"]
-            logger.info(f"Extracting profile for customer: {customer_id}")
+            logger.info(f"Extracting details for customer: {customer_id}")
             
-            # Get customer basic info
-            customer_query = """SELECT DISTINCT customer_id, customer_name, industry, annual_revenue_usd, number_of_employees, customer_priority, customer_rating, account_type, "location", current_products, product_usage_percent, cross_sell_synergy, last_activity_date, opportunity_stage FROM customer_data WHERE customer_id = %s"""
+            response = self.sql_agent.query(f"Extract the entire customer profile for {customer_id} from table 'customer_data'. Include columns: customer_id, customer_name, industry, annual_revenue_usd, number_of_employees, customer_priority, customer_rating, account_type, location, current_products, product_usage_percent, cross_sell_synergy, last_activity_date, opportunity_stage. Also extract the entire customer purchase history for {customer_id} from table 'customer_data'. Include columns: product, quantity, unit_price_usd, total_price_usd, purchase_date.")
             
-            customer_data = self.db_manager.execute_query(customer_query, (customer_id,))
+            messages = response['messages']
+            ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
+            detail = ai_messages[-1].content if ai_messages else None
             
-            if not customer_data:
-                state["error"] = f"Customer {customer_id} not found"
-                return state
-            
-            customer = customer_data[0]
-            customer["annual_revenue_usd"] = round(float(customer["annual_revenue_usd"][1:].replace(",", "").strip()))
-            
-            purchase_query = """
-            SELECT product, quantity, unit_price_usd, total_price_usd, purchase_date
-            FROM customer_data 
-            WHERE customer_id = %s
-            ORDER BY purchase_date DESC
-            """
-            
-            purchases = self.db_manager.execute_query(purchase_query, (customer_id,))
-            
-            for p in purchases:
-                p["total_price_usd"] = round(float(p["total_price_usd"][1:].replace(",", "").strip()))
-                p["unit_price_usd"] = round(float(p["unit_price_usd"][1:].replace(",", "").strip()))
-            
-            profile = {
-                "customer_id": customer["customer_id"],
-                "customer_name": customer["customer_name"],
-                "industry": customer["industry"],
-                "annual_revenue": customer["annual_revenue_usd"],
-                "employees": customer["number_of_employees"],
-                "priority": customer["customer_priority"],
-                "rating": customer["customer_rating"],
-                "account_type": customer["account_type"],
-                "location": customer["location"],
-                "current_products": customer["current_products"],
-                "product_usage": customer["product_usage_percent"],
-                "cross_sell_synergy": customer["cross_sell_synergy"],
-                "last_activity": customer["last_activity_date"],
-                "opportunity_stage": customer["opportunity_stage"],
-                "purchase_history": [dict(p) for p in purchases],
-                "total_purchases": len(purchases),
-                "total_spent": sum(p["total_price_usd"] for p in purchases),
-            }
-            
-            state["customer_profile"] = profile
-            logger.info(f"Successfully extracted profile for {customer['customer_name']}")
+            state["customer_details"] = detail
+            logger.info(f"Successfully extracted details for {customer_id}")
             
         except Exception as e:
             logger.error(f"Error in CustomerContextAgent: {e}")
@@ -139,42 +100,29 @@ class CustomerContextAgent:
         return state
 
 class PurchasePatternAnalysis:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db_manager = db_manager
+    def __init__(self, sql_agent: SQLAgent):
+        """Initialize the PurchasePatternAnalysis with an SQLAgent instance."""
+        self.sql_agent = sql_agent
     
     def analyze_patterns(self, state: AgentState) -> AgentState:
+        """Analyze purchase patterns for the customer and identify frequent products, spending, and opportunities."""
         try:
-            if state.get("error") or not state.get("customer_profile"):
+            if state.get("error") or not state.get("customer_details"):
                 return state
             
-            customer_profile = state["customer_profile"]
-            purchase_history = customer_profile["purchase_history"]
+            logger.info(f"Analyzing purchase patterns for customer {state['customer_id']}")
             
-            # Analyze purchase frequency
-            product_purchase_freq = Counter(p["product"] for p in purchase_history)
-            product_spending = defaultdict(float)
+            customer_details = state["customer_details"]
             
-            for purchase in purchase_history:
-                product_spending[purchase["product"]] += purchase["total_price_usd"]
+            response = self.sql_agent.query(f"Here's the details for a customer: {customer_details}. Analyze the purchase patterns of this customer. Identify frequent products, product spending, missing opportunities, and calculate purchase frequency score and average order value.")
             
-            # Missing Oppotunity
-            product_list = list(product_purchase_freq.keys())
-            placeholders = ', '.join(['%s'] * len(product_list))
-            
-            missing_products_query = f"""SELECT DISTINCT product FROM customer_data WHERE product NOT IN ({placeholders})"""
-            missing_products = [p['product'] for p in self.db_manager.execute_query(missing_products_query, product_list)]
-
-            patterns = {
-                "frequent_products": dict(product_purchase_freq.most_common(5)),  # Top 5 frequent products
-                "product_spending": dict(product_spending),
-                "missing_opportunities": missing_products,
-                "purchase_frequency_score": round(len(purchase_history) / 12, 3) if purchase_history else 0,  # frequency score calculated per month
-                "avg_order_value": (sum(p["total_price_usd"] for p in purchase_history) / len(purchase_history)) if purchase_history else 0
-            }
+            messages = response['messages']
+            ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
+            patterns = ai_messages[-1].content if ai_messages else None
             
             state["purchase_patterns"] = patterns
-            logger.info(f"Analyzed purchase patterns - {len(missing_products)} missing opportunities found")
-        
+            logger.info(f"Analyzed purchase patterns for customer {state['customer_id']}")
+            
         except Exception as e:
             logger.error(f"Error in PurchasePatternAnalysis: {e}")
             state["error"] = str(e)
@@ -182,46 +130,31 @@ class PurchasePatternAnalysis:
         return state
 
 class ProductAffinityAgent:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db_manager = db_manager
+    def __init__(self, sql_agent: SQLAgent):
+        """Initialize the ProductAffinityAgent with an SQLAgent instance."""
+        self.sql_agent = sql_agent
     
     def suggest_related_products(self, state: AgentState) -> AgentState:
+        """Suggest related products based on customer purchase patterns and affinities."""
         try:
-            affinites = {}
-            if state.get("error") or not state.get("customer_profile"):
+            if state.get("error") or not state.get("customer_details") or not state.get("purchase_patterns"):
                 return state
             
-            customer_profile = state["customer_profile"]
-            product_purchase_freq = Counter(p["product"] for p in customer_profile['purchase_history'])
-            product_list = list(product_purchase_freq.keys())
-            placeholders = ', '.join(['%s'] * len(product_list))
+            logger.info(f"Generating related product suggestions for customer {state['customer_id']}")
             
-            # Cross-sell opportunities
-            related_products_query = f"""SELECT DISTINCT product, COUNT(*) AS product_count FROM customer_data WHERE customer_id = ANY(SELECT DISTINCT customer_id FROM customer_data WHERE product IN ({placeholders})) AND product NOT IN ({placeholders}) GROUP BY product ORDER BY product_count DESC"""
-            query_result = self.db_manager.execute_query(related_products_query, (product_list+ product_list))
-            if query_result is None or query_result == []:
-                    state["error"] = "No cross-sell opportunities found"
-            else:         
-                related_products = {p['product']: p['product_count'] for p in query_result}
-                affinites['cross-sell'] = related_products
-                logger.info(f"Analyzed product affinities - {len(related_products)} cross-sell opportunities found")
+            customer_details = state["customer_details"]
+            patterns = state["purchase_patterns"]
             
-            # Upsell opportunities
-            upsell_query = f"""SELECT product, (AVG(total_price)::numeric::money) as avg_price FROM (SELECT customer_id, product, SUM(total_price_usd::numeric::float8) AS total_price FROM customer_data WHERE product IN ({placeholders}) AND customer_id != %s GROUP BY customer_id, product) GROUP BY product ORDER BY product"""
-            query_result = self.db_manager.execute_query(upsell_query, (product_list+[customer_profile["customer_id"]]))
-            if query_result is None or query_result == []:
-                state["error"] = "No upsell opportunities found"
-            else:
-                upsell_products = {p['product']: (round(float(p["avg_price"][1:].replace(",", "").strip()), 2)) for p in query_result}
-
-                upsell_opportunities = {}
-                for product, customer_value in state['purchase_patterns']['product_spending'].items():
-                    if product in upsell_products:
-                        if(customer_value > upsell_products[product]*1.2):
-                            upsell_opportunities[product] = (customer_value - upsell_products[product])/ upsell_products[product]*100       # Percentage the customer is spending per product compared to average
-                affinites["upsell"] = upsell_opportunities
-                logger.info(f"Analyzed product affinities - {len(related_products)} upsell opportunities found")
-            state["product_affinities"] = affinites
+            response = self.sql_agent.query(f"""Here's the details for a customer: {customer_details}.
+Here's the purchase patterns for the same customer: {patterns}.
+Analyze the product affinities for this customer. Identify cross-sell and upsell opportunities based on their purchase history and patterns. Provide a structured output with cross-sell and upsell opportunities, including product names and potential revenue impact.""")
+            
+            messages = response['messages']
+            ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
+            affinities = ai_messages[-1].content if ai_messages else None
+            
+            state["product_affinities"] = affinities
+            logger.info(f"Generated related product suggestions for customer {state['customer_id']}")
             
         except Exception as e:
             logger.error(f"Error in ProductAffinityAgent: {e}")
@@ -230,39 +163,50 @@ class ProductAffinityAgent:
         return state
 
 class OpportunityScoringAgent:
+    def __init__(self, sql_agent: SQLAgent):
+        """Initialize the OpportunityScoringAgent with an SQLAgent instance."""
+        self.sql_agent = sql_agent
+    
     def score_opportunities(self, state: AgentState) -> AgentState:
-        if state.get("error") or not state.get("product_affinities"):
-            return state
-        # Cross-sell scoring
-        total = sum(state['product_affinities']['cross-sell'].values())
-        scored_cross_sell = {
-            product: (qty / total) * 100
-            for product, qty in state['product_affinities']['cross-sell'].items()
-        }
-        
-        sorted_cross_sell = dict(sorted(scored_cross_sell.items(), key=lambda x: x[1], reverse=True))
+        """Score cross-sell and upsell opportunities based on purchase patterns and product affinities."""
+        try:
+            if state.get("error") or not state.get("customer_details") or not state.get("purchase_patterns") or not state.get("product_affinities"):
+                return state
 
-        # Upsell scoring
-        # High spend over peers - low upsell, low spend over peers - high upsell
-        upsell_scores = {
-            product: max(0, 100 - diff)
-            for product, diff in state['product_affinities']['upsell'].items()
-        }
+            logger.info(f"Scoring cross-sell and upsell opportunities for customer {state['customer_id']}")
+            
+            customer_details = state["customer_details"]
+            patterns = state["purchase_patterns"]
+            affinities = state["product_affinities"]
+            
+            response = self.sql_agent.query(f"""Here's the details for a customer: {customer_details}.
+Here's the purchase patterns for the same customer: {patterns}.
+Here's the product affinities for the same customer: {affinities}.
+Analyze the cross-sell and upsell opportunities for this customer. Score the opportunities based on purchase frequency, product affinities, and potential revenue impact. Provide a structured output with cross-sell and upsell scores, including reasoning for each score.""")
+            
+            messages = response['messages']
+            ai_messages = [msg for msg in messages if isinstance(msg, AIMessage)]
+            scores = ai_messages[-1].content if ai_messages else None
+            
+            state["opportunity_scores"] = scores
+            logger.info(f"Scored cross-sell and upsell opportunities for customer {state['customer_id']}")
+            
+        except Exception as e:
+            logger.error(f"Error in OpportunityScoringAgent: {e}")
+            state["error"] = str(e)
         
-        upsell_scores = dict(sorted(upsell_scores.items(), key=lambda x: x[1], reverse=True))
-        
-        scores = {
-            "cross_sell": sorted_cross_sell,
-            "cross_sell_reasoning": "Cross-sell opportunities are scored based on the frequency of purchases of related products. Values are percentages, higher values indicate stronger cross-sell potential.",
-            "upsell": upsell_scores,
-            "upsell_reasoning": "Upsell opportunities are scored based on the difference between the customer's spending and the average spending of peers on the same product. Higher scores indicate greater potential for upsell.",
-        }
-        state["opportunity_scores"] = scores
-        logger.info(f"Scored opportunities - {len(scores['cross_sell'])} cross-sell and {len(scores['upsell'])} upsell opportunities remain after filtering")
         return state
+
+class Output(BaseModel):
+    customer_id: str
+    research_report: str
+    recommendation_list: list[str]
 
 class RecommendationReportAgent:
     def generate_report(self, state: AgentState) -> AgentState:
+        """Generate a comprehensive recommendation report based on customer data and analysis results."""
+        
+        logger.info("Generating recommendation report...")
         
         format = """Research Report: Cross-Sell and Upsell Opportunities for Acme Corp
 Introduction:
@@ -289,16 +233,20 @@ and customer satisfaction."""
         client = genai.Client(api_key = os.getenv("Gemini_API_Key"))
         try:
             response = client.models.generate_content(
-                model="gemini-1.5-flash-8b",
+                model="gemini-2.0-flash-lite",
                 config=types.GenerateContentConfig(
-                    system_instruction="You are an expert business and data analyst. Generate a comprehensive report in the given example format based on the provided data (customer data and analysis results). Do not output anything outside of this format.",
+                    response_mime_type= "application/json",
+                    response_schema= Output,
+                    system_instruction="You are an expert business and data analyst. Generate a comprehensive report and recommendation list following the given sample report based on the provided data (customer data and analysis results) unless the data seems empty or faulty. In that case, just say 'Error: No data available for analysis.'.",
                 ),
-                contents=f"REPORT FORMAT: {format}\nDATA: {state}"
+                contents=f"""REPORT SAMPLE: {format}
+DATA: {state}"""
             )
         except Exception as e:
             logger.error(f"Error generating report: {e}")
             state["error"] = str(e)
             return state
+        
         logger.info("Recommendation report generated successfully")
         
         self._create_report_file(response.text)
@@ -313,11 +261,11 @@ and customer satisfaction."""
 
 class CrossSellUpsellAgent:
     def __init__(self, db_config: Dict):
-        self.db_manager = DatabaseManager(db_config)
-        self.customer_agent = CustomerContextAgent(self.db_manager)
-        self.pattern_agent = PurchasePatternAnalysis(self.db_manager)
-        self.affinity_agent = ProductAffinityAgent(self.db_manager)
-        self.scoring_agent = OpportunityScoringAgent()
+        self.sql_agent = SQLAgent(db_config)
+        self.customer_agent = CustomerContextAgent(self.sql_agent)
+        self.pattern_agent = PurchasePatternAnalysis(self.sql_agent)
+        self.affinity_agent = ProductAffinityAgent(self.sql_agent)
+        self.scoring_agent = OpportunityScoringAgent(self.sql_agent)
         self.report_agent = RecommendationReportAgent()
         
         # Build the graph
@@ -327,7 +275,7 @@ class CrossSellUpsellAgent:
         workflow = StateGraph(AgentState)
         
         # Add nodes
-        workflow.add_node("customer_context_node", self.customer_agent.extract_customer_profile)
+        workflow.add_node("customer_context_node", self.customer_agent.extract_customer_details)
         workflow.add_node("purchase_patterns_node", self.pattern_agent.analyze_patterns)
         workflow.add_node("product_affinity_node", self.affinity_agent.suggest_related_products)
         workflow.add_node("opportunity_scoring_node", self.scoring_agent.score_opportunities)
@@ -350,9 +298,7 @@ class CrossSellUpsellAgent:
         if result.get("error"):
             raise Exception(result["error"])
         
-        return {
-            "research_report": result.get("research_report")
-        }
+        return result.get("research_report")
 
 app = FastAPI(title="Cross-Sell/Upsell Recommendation API")
 agent = CrossSellUpsellAgent(DB_CONFIG)
@@ -361,11 +307,10 @@ agent = CrossSellUpsellAgent(DB_CONFIG)
 async def get_recommendations(customer_id: str):
     try:
         result = agent.run_analysis(customer_id)
-        return {
-            "customer_id": customer_id,
-            "research_report": result["research_report"],
-            "timestamp": datetime.now().isoformat()
-        }
+        return result
+    except TooManyRequests as e:
+        logger.error(f"Rate limit exceeded for gemini api: {e}")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please try again later.")
     except Exception as e:
         logger.error(f"API Error for customer {customer_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
